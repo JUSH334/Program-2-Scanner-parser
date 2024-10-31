@@ -1,0 +1,458 @@
+#lang racket
+
+;; -------------------------------------------------------------------
+;; Tokenizer
+;; -------------------------------------------------------------------
+
+(define (string-blank? str)
+  (regexp-match? #px"^[[:space:]]*$" str))
+
+(define (string-empty? str)
+  (string=? str ""))
+
+(define (tokenize input-string)
+  (define (scan input tokens)
+    (if (or (string-empty? input) (string-blank? input))
+        (reverse tokens)
+        (cond
+         ;; Skip comments by not adding any token
+          [(regexp-match #px"^(REM)[^\n]*" (string-upcase input))
+           => (lambda (match)
+                (let* ([matched (car match)]
+                       [rest (substring input (string-length matched))])
+                  ;; Continue scanning without adding a token
+                  (scan rest tokens)))]
+          
+          ;; Match keywords and identifiers
+          [(regexp-match #px"^[A-Za-z][A-Za-z0-9]*" input)
+           => (lambda (match)
+                (let* ([matched (substring input 0 (string-length (car match)))])
+                  (scan (substring input (string-length matched))
+                        (cons (if (member (string-downcase matched)
+                                          '("def" "enddef" "end" "if" "then" "endif" 
+                                            "while" "do" "endwhile" "print" "return" 
+                                            "not" "and" "or"))
+                                  `(keyword ,(string-downcase matched))
+                                  `(id ,matched)) 
+                              tokens))))]
+          
+          ;; Match multi-character operators
+          [(regexp-match #px"^(<>|><|<=|>=|:=)" input)
+           => (lambda (match)
+                (let* ([matched (car match)]
+                       [rest (substring input (string-length matched))])
+                  (scan rest (cons (case matched
+                                     [(string=? matched ":=") `(assign ,matched)]
+                                     [(or "<>" "><" "<=" ">=") `(operator ,matched)]
+                                     [else (error "Unknown multi-character operator" matched)]) 
+                                   tokens))))]
+          
+          ;; Match single-character operators and symbols
+          [(regexp-match #px"^[+*/=<>():;,-]" input)
+           => (lambda (match)
+                (let* ([matched (car match)]
+                       [rest (substring input 1)])
+                  (scan rest (cons (cond
+                                     [(string=? matched "+") `(plus "+")]
+                                     [(string=? matched "-") `(minus "-")]
+                                     [(string=? matched "*") `(times "*")]
+                                     [(string=? matched "/") `(divide "/")]
+                                     [(string=? matched "(") `(lparen "(")]
+                                     [(string=? matched ")") `(rparen ")")]
+                                     [(string=? matched ":") `(colon ":")]
+                                     [(string=? matched "=") `(operator "=")]
+                                     [(string=? matched "<") `(operator "<")]
+                                     [(string=? matched ">") `(operator ">")]
+                                     [(string=? matched ";") `(semicolon ";")]
+                                     [(string=? matched ",") `(comma ",")]
+                                     [else (error "Unknown single-character token" matched)])
+                                   tokens))))]
+
+          ;; Match numbers (real numbers first)
+          [(regexp-match #px"^[0-9]+\\.[0-9]+" input)
+           => (lambda (match)
+                (let* ([matched (car match)]
+                       [rest (substring input (string-length matched))])
+                  (scan rest (cons `(real ,matched) tokens))))]
+          
+          ;; Match integers
+          [(regexp-match #px"^[0-9]+" input)
+           => (lambda (match)
+                (let* ([matched (car match)]
+                       [rest (substring input (string-length matched))])
+                  (scan rest (cons `(integer ,matched) tokens))))]
+          
+          ;; Match strings
+          [(regexp-match #px"^\"([^\"]*)\"" input)
+           => (lambda (match)
+                (let* ([matched (cadr match)]
+                       [rest (substring input (+ 2 (string-length matched)))])
+                  (scan rest (cons `(string ,matched) tokens))))]
+          
+          ;; Skip whitespace
+          [(regexp-match #px"^[[:space:]]+" input)
+           => (lambda (match)
+                (scan (substring input (string-length (car match))) tokens))]
+          
+          ;; Handle unexpected input
+          [else (error "Unexpected character sequence: " 
+                       (substring input 0 (min (string-length input) 10)))])))
+    
+    (scan input-string '()))
+
+;; -------------------------------------------------------------------
+;; Parser Utilities
+;; -------------------------------------------------------------------
+
+(define (tokens-empty? tokens) (null? tokens))
+(define (current-token tokens) (if (tokens-empty? tokens) (error "Unexpected end of input") (car tokens)))
+(define (next-tokens tokens) (if (tokens-empty? tokens) (error "Unexpected end of input") (cdr tokens)))
+
+(define (match-token tokens expected-type expected-value)
+  (let ((token (current-token tokens)))
+    (if (and (eq? (car token) expected-type)
+             (or (not (string? expected-value))
+                 (string-ci=? (cadr token) expected-value)))
+        (next-tokens tokens)
+        (error (format "Expected ~a '~a', got '~a'" expected-type expected-value (cadr token))))))
+
+(define (match-token-type tokens expected-type)
+  (let ((token (current-token tokens)))
+    (if (eq? (car token) expected-type)
+        (values token (next-tokens tokens))
+        (error (format "Expected token of type ~a, got ~a" expected-type (car token))))))
+
+(define end-keywords '("endif" "enddef" "endwhile"))
+
+;; -------------------------------------------------------------------
+;; Parsing Functions
+;; -------------------------------------------------------------------
+
+;; Parse <Lines>
+(define (parse-lines tokens)
+  (let-values (((statements tokens-after-statements) (parse-statements tokens)))
+    (if (tokens-empty? tokens-after-statements)
+        statements
+        (begin
+          (displayln "Unexpected tokens after parsing lines:")
+          (pretty-print tokens-after-statements)
+          (error "Unexpected tokens after parsing lines")))))
+
+;; Parse <Statements>
+(define (parse-statements tokens)
+  (let loop ((tokens tokens)
+             (statements '()))
+    (if (tokens-empty? tokens)
+        (values (reverse statements) tokens)
+        (let ((token (current-token tokens)))
+          (if (and (eq? (car token) 'keyword)
+                   (member (string-downcase (cadr token)) end-keywords))
+              (values (reverse statements) tokens)
+              (let-values (((statement tokens-after-statement) (parse-statement tokens)))
+                (let ((tokens tokens-after-statement))
+                  (if (not (tokens-empty? tokens))
+                      (let ((token (current-token tokens)))
+                        (if (eq? (car token) 'colon)
+                            (loop (next-tokens tokens) (cons statement statements))
+                            (loop tokens (cons statement statements))))
+                      (values (reverse (cons statement statements)) tokens)))))))))
+
+;; Parse <Statement>
+(define (parse-statement tokens)
+  (let ((token (current-token tokens)))
+    (cond
+      ;; DEF ID ( <ID List> ) <Statements> ENDDEF
+      [(and (eq? (car token) 'keyword) (string-ci=? (cadr token) "def"))
+       (let ((tokens-after-def (next-tokens tokens)))
+         (let-values (((id-token tokens-after-id) (match-token-type tokens-after-def 'id)))
+           (let ((tokens-after-lparen (match-token tokens-after-id 'lparen "(")))
+             (let-values (((id-list tokens-after-id-list) (parse-id-list tokens-after-lparen)))
+               (let ((tokens-after-rparen (match-token tokens-after-id-list 'rparen ")")))
+                 (let-values (((body-statements tokens-after-body) (parse-statements tokens-after-rparen)))
+                   (let ((tokens-after-enddef (match-token tokens-after-body 'keyword "enddef")))
+                     (values (list 'DEF id-token id-list body-statements)
+                             tokens-after-enddef))))))))]
+      
+      ;; END keyword as a statement
+      [(and (eq? (car token) 'keyword) (string-ci=? (cadr token) "end"))
+       (values (list 'END) (next-tokens tokens))]
+      
+      ;; IF <Expression> THEN <Statements> ENDIF
+      [(and (eq? (car token) 'keyword) (string-ci=? (cadr token) "if"))
+       (let ((tokens-after-if (next-tokens tokens)))
+         (let-values (((expr tokens-after-expr) (parse-expression tokens-after-if)))
+           (let ((tokens-after-then (match-token tokens-after-expr 'keyword "then")))
+             (let-values (((statements tokens-after-statements) (parse-statements tokens-after-then)))
+               (let ((tokens-after-endif (match-token tokens-after-statements 'keyword "endif")))
+                 (values (list 'IF expr statements)
+                         tokens-after-endif))))))]
+      
+      ;; WHILE <Expression> DO <Statements> ENDWHILE
+      [(and (eq? (car token) 'keyword) (string-ci=? (cadr token) "while"))
+       (let ((tokens-after-while (next-tokens tokens)))
+         (let-values (((expr tokens-after-expr) (parse-expression tokens-after-while)))
+           (let ((tokens-after-do (match-token tokens-after-expr 'keyword "do")))
+             (let-values (((statements tokens-after-statements) (parse-statements tokens-after-do)))
+               (let ((tokens-after-endwhile (match-token tokens-after-statements 'keyword "endwhile")))
+                 (values (list 'WHILE expr statements)
+                         tokens-after-endwhile))))))]
+      
+      ;; PRINT <Print List>
+      [(and (eq? (car token) 'keyword) (string-ci=? (cadr token) "print"))
+       (let ((tokens-after-print (next-tokens tokens)))
+         (let-values (((print-list tokens-after-print-list) (parse-print-list tokens-after-print)))
+           (values (list 'PRINT print-list) tokens-after-print-list)))]
+      
+      ;; RETURN <Expression>
+      [(and (eq? (car token) 'keyword) (string-ci=? (cadr token) "return"))
+       (let ((tokens-after-return (next-tokens tokens)))
+         (let-values (((expr tokens-after-expr) (parse-expression tokens-after-return)))
+           (values (list 'RETURN expr) tokens-after-expr)))]
+      
+      ;; REMARK
+      [(eq? (car token) 'remark)
+       (values (list 'REMARK (cadr token)) (next-tokens tokens))]
+      
+      ;; ID assignment or function call
+      [(eq? (car token) 'id)
+       (let ((tokens-after-id (next-tokens tokens))
+             (id-token token))
+         (if (not (tokens-empty? tokens-after-id))
+             (let ((next-token (current-token tokens-after-id)))
+               (cond
+                 ;; Assignment: ID ':=' <Expression>
+                 [(eq? (car next-token) 'assign)
+                  (let ((tokens-after-assign (next-tokens tokens-after-id)))
+                    (let-values (((expr tokens-after-expr) (parse-expression tokens-after-assign)))
+                      (values (list 'ASSIGN id-token expr) tokens-after-expr)))]
+                 
+                 ;; Function call: ID '(' <Expression List> ')'
+                 [(eq? (car next-token) 'lparen)
+                  (let ((tokens-after-lparen (next-tokens tokens-after-id)))
+                    (let-values (((expr-list tokens-after-expr-list) (parse-expression-list tokens-after-lparen)))
+                      (let ((tokens-after-rparen (match-token tokens-after-expr-list 'rparen ")")))
+                        (values (list 'CALL id-token expr-list) tokens-after-rparen))))]
+                 
+                 ;; Standalone ID (could be an error)
+                 [else
+                  (error "Unexpected token after ID" next-token)]))
+             (error "Unexpected end of input after ID")))]
+      
+      ;; Unknown statement type
+      [else
+       (error "Unknown statement type starting with" token)])))
+
+;; Parse <ID List>
+(define (parse-id-list tokens)
+  (let-values (((id-token tokens-after-id) (match-token-type tokens 'id)))
+    (let loop ((ids (list id-token))
+               (tokens tokens-after-id))
+      (if (not (tokens-empty? tokens))
+          (let ((token (current-token tokens)))
+            (if (eq? (car token) 'comma)
+                (let ((tokens-after-comma (next-tokens tokens)))
+                  (let-values (((next-id-token tokens-after-next-id) (match-token-type tokens-after-comma 'id)))
+                    (loop (append ids (list next-id-token)) tokens-after-next-id)))
+                (values ids tokens)))
+          (values ids tokens)))))
+
+;; Parse <Expression List>
+(define (parse-expression-list tokens)
+  (let-values (((expr tokens-after-expr) (parse-expression tokens)))
+    (let loop ((exprs (list expr))
+               (tokens tokens-after-expr))
+      (if (not (tokens-empty? tokens))
+          (let ((token (current-token tokens)))
+            (if (eq? (car token) 'comma)
+                (let ((tokens-after-comma (next-tokens tokens)))
+                  (let-values (((next-expr tokens-after-next-expr) (parse-expression tokens-after-comma)))
+                    (loop (append exprs (list next-expr)) tokens-after-next-expr)))
+                (values exprs tokens)))
+          (values exprs tokens)))))
+
+;; Parse <Print List>
+(define (parse-print-list tokens)
+  (if (tokens-empty? tokens)
+      (values '() tokens)
+      (let-values (((expr tokens-after-expr) (parse-expression tokens)))
+        (let ((tokens tokens-after-expr))
+          (if (not (tokens-empty? tokens))
+              (let ((token (current-token tokens)))
+                (if (eq? (car token) 'semicolon)
+                    (let ((tokens-after-semicolon (next-tokens tokens)))
+                      (let-values (((next-print-list tokens-after-next-print-list)
+                                    (parse-print-list tokens-after-semicolon)))
+                        (values (cons expr next-print-list) tokens-after-next-print-list)))
+                    (values (list expr) tokens)))
+              (values (list expr) tokens))))))
+
+;; Operator precedence lists
+(define compare-operators '("=" "<>" "><" ">" ">=" "<" "<="))
+(define add-operators '("+"))
+(define sub-operators '("-"))
+(define mult-operators '("*" "/"))
+
+;; Parse <Expression>
+(define (parse-expression tokens)
+  (let-values (((left-exp tokens-after-left) (parse-and-exp tokens)))
+    (if (not (tokens-empty? tokens-after-left))
+        (let ((token (current-token tokens-after-left)))
+          (if (and (eq? (car token) 'keyword) (string-ci=? (cadr token) "or"))
+              (let ((tokens-after-or (next-tokens tokens-after-left)))
+                (let-values (((right-exp tokens-after-right) (parse-expression tokens-after-or)))
+                  (values (list 'OR left-exp right-exp) tokens-after-right)))
+              (values left-exp tokens-after-left)))
+        (values left-exp tokens-after-left))))
+
+;; Parse <And Exp>
+(define (parse-and-exp tokens)
+  (let-values (((left-exp tokens-after-left) (parse-not-exp tokens)))
+    (if (not (tokens-empty? tokens-after-left))
+        (let ((token (current-token tokens-after-left)))
+          (if (and (eq? (car token) 'keyword) (string-ci=? (cadr token) "and"))
+              (let ((tokens-after-and (next-tokens tokens-after-left)))
+                (let-values (((right-exp tokens-after-right) (parse-and-exp tokens-after-and)))
+                  (values (list 'AND left-exp right-exp) tokens-after-right)))
+              (values left-exp tokens-after-left)))
+        (values left-exp tokens-after-left))))
+
+;; Parse <Not Exp>
+(define (parse-not-exp tokens)
+  (let ((token (current-token tokens)))
+    (if (and (eq? (car token) 'keyword) (string-ci=? (cadr token) "not"))
+        (let ((tokens-after-not (next-tokens tokens)))
+          (let-values (((expr tokens-after-expr) (parse-compare-exp tokens-after-not)))
+            (values (list 'NOT expr) tokens-after-expr)))
+        (parse-compare-exp tokens))))
+
+;; Parse <Compare Exp>
+(define (parse-compare-exp tokens)
+  (let-values (((left-exp tokens-after-left) (parse-add-exp tokens)))
+    (if (not (tokens-empty? tokens-after-left))
+        (let ((token (current-token tokens-after-left)))
+          (if (and (eq? (car token) 'operator)
+                   (member (cadr token) compare-operators))
+              (let ((operator-token (cadr token))
+                    (tokens-after-operator (next-tokens tokens-after-left)))
+                (let-values (((right-exp tokens-after-right) (parse-add-exp tokens-after-operator)))
+                  (values (list 'COMPARE left-exp operator-token right-exp)
+                          tokens-after-right)))
+              (values left-exp tokens-after-left)))
+        (values left-exp tokens-after-left))))
+
+;; Parse <Add Exp>
+(define (parse-add-exp tokens)
+  (let-values (((left-exp tokens-after-left) (parse-mult-exp tokens)))
+    (let loop ((left-exp left-exp)
+               (tokens tokens-after-left))
+      (if (not (tokens-empty? tokens))
+          (let ((token (current-token tokens)))
+            (if (or (eq? (car token) 'plus) (eq? (car token) 'minus))
+                (let ((operator (cadr token))
+                      (op-symbol (if (eq? (car token) 'plus) 'ADD 'SUB))
+                      (tokens-after-operator (next-tokens tokens)))
+                  (let-values (((right-exp tokens-after-right) (parse-mult-exp tokens-after-operator)))
+                    (loop (list op-symbol left-exp `(operator ,operator) right-exp)
+                          tokens-after-right)))
+                (values left-exp tokens)))
+          (values left-exp tokens)))))
+
+;; Parse <Mult Exp>
+(define (parse-mult-exp tokens)
+  (let-values (((left-exp tokens-after-left) (parse-negate-exp tokens)))
+    (let loop ((left-exp left-exp)
+               (tokens tokens-after-left))
+      (if (not (tokens-empty? tokens))
+          (let ((token (current-token tokens)))
+            (if (or (eq? (car token) 'times) (eq? (car token) 'divide))
+                (let ((operator (cadr token))
+                      (op-symbol (if (eq? (car token) 'times) 'MULT 'DIVIDE))
+                      (tokens-after-operator (next-tokens tokens)))
+                  (let-values (((right-exp tokens-after-right) (parse-negate-exp tokens-after-operator)))
+                    (loop (list op-symbol left-exp `(operator ,operator) right-exp)
+                          tokens-after-right)))
+                (values left-exp tokens)))
+          (values left-exp tokens)))))
+
+;; Parse <Negate Exp>
+(define (parse-negate-exp tokens)
+  (let ((token (current-token tokens)))
+    (if (eq? (car token) 'minus)
+        (let ((tokens-after-minus (next-tokens tokens)))
+          (let-values (((value tokens-after-value) (parse-negate-exp tokens-after-minus)))
+            (values (list 'NEGATE value) tokens-after-value)))
+        (parse-value tokens))))
+
+;; Parse <Value>
+(define (parse-value tokens)
+  (let ((token (current-token tokens)))
+    (cond
+      ;; '(' <Expression> ')'
+      [(eq? (car token) 'lparen)
+       (let ((tokens-after-lparen (next-tokens tokens)))
+         (let-values (((expr tokens-after-expr) (parse-expression tokens-after-lparen)))
+           (let ((tokens-after-rparen (match-token tokens-after-expr 'rparen ")")))
+             (values expr tokens-after-rparen))))]
+      
+      ;; ID '(' <Expression List> ')'
+      [(and (eq? (car token) 'id))
+       (let ((id-token token)
+             (tokens-after-id (next-tokens tokens)))
+         (if (not (tokens-empty? tokens-after-id))
+             (let ((next-token (current-token tokens-after-id)))
+               (if (eq? (car next-token) 'lparen)
+                   (let ((tokens-after-lparen (next-tokens tokens-after-id)))
+                     (let-values (((expr-list tokens-after-expr-list) (parse-expression-list tokens-after-lparen)))
+                       (let ((tokens-after-rparen (match-token tokens-after-expr-list 'rparen ")")))
+                         (values (list 'CALL id-token expr-list) tokens-after-rparen))))
+                   (values id-token tokens-after-id)))
+             (values id-token tokens-after-id)))]
+      
+      ;; ID
+      [(eq? (car token) 'id)
+       (values token (next-tokens tokens))]
+      
+      ;; Constants
+      [(member (car token) '(integer real string))
+       (values token (next-tokens tokens))]
+      
+      ;; Error
+      [else
+       (error "Expected a value, got" token)])))
+
+;; -------------------------------------------------------------------
+;; Example Usage
+;; -------------------------------------------------------------------
+
+;; Sample input
+(define input "REM example comments
+x := 5
+y := x + 1 : z := (y - 2) * 3
+A := somefunction(z)
+PRINT (z * 2)
+PRINT \"A = \" ; A
+END
+DEF somefunction(a)
+  WHILE a <= 0 DO
+      a := a + 10
+  ENDWHILE : REM just some fiddling around to test the language
+  IF a > 5 THEN
+    a := a + 2
+    RETURN a * 3
+  ENDIF
+  RETURN a : REM else clause
+ENDDEF")
+
+;; Tokenize the input
+(define tokens (tokenize input))
+
+;; Uncomment the following line to see the tokens
+(displayln "Tokens:")
+(pretty-print tokens)
+
+;; Parse the tokens starting from <Lines>
+(define parse-tree (parse-lines tokens))
+
+;; Display the parse tree
+(displayln "Parse Tree:")
+(pretty-print parse-tree)
